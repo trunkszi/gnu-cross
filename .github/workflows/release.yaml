@@ -1,0 +1,255 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: 'Target architecture list (comma-separated)'
+        required: false
+        default: 'x86_64-unknown-linux-gnu'
+        type: string
+      containers:
+        description: 'Container selection (comma-separated: amazonlinux2,alinux3,centos7,ubuntu22,all)'
+        required: false
+        default: 'all'
+        type: string
+      create_release:
+        description: 'Create GitHub Release'
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        description: 'Release tag (required if create_release is true)'
+        required: false
+        default: ''
+        type: string
+  release:
+    types:
+      - published
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  # Prepare build matrix
+  prepare-matrix:
+    name: Prepare Build Matrix
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up matrix
+        id: set-matrix
+        run: |
+          # Define all available container configurations
+          declare -A containers
+          containers[amazonlinux2]='{"image":"public.ecr.aws/amazonlinux/amazonlinux:2","label":"amazonlinux2"}'
+          containers[alinux3]='{"image":"alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest","label":"alinux3"}'
+          containers[centos7]='{"image":"centos:7.9.2009","label":"centos7"}'
+          containers[ubuntu22]='{"image":"ubuntu:22.04","label":"ubuntu22"}'
+
+          # Parse target architectures
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            IFS=',' read -ra TARGETS <<< "${{ inputs.targets }}"
+            CONTAINER_INPUT="${{ inputs.containers }}"
+          else
+            TARGETS=("x86_64-unknown-linux-gnu")
+            CONTAINER_INPUT="all"
+          fi
+
+          # Parse container selection
+          if [ "$CONTAINER_INPUT" = "all" ]; then
+            SELECTED_CONTAINERS=("amazonlinux2" "alinux3" "centos7" "ubuntu22")
+          else
+            IFS=',' read -ra SELECTED_CONTAINERS <<< "$CONTAINER_INPUT"
+          fi
+
+          # Build matrix
+          matrix_json='{"include":['
+          first=true
+          for target in "${TARGETS[@]}"; do
+            for container in "${SELECTED_CONTAINERS[@]}"; do
+              if [ "$first" = true ]; then
+                first=false
+              else
+                matrix_json+=','
+              fi
+              matrix_json+="{\"target\":\"$target\",\"container\":${containers[$container]}}"
+            done
+          done
+          matrix_json+=']}'
+
+          echo "matrix=$matrix_json" >> $GITHUB_OUTPUT
+          echo "Generated matrix:"
+          echo "$matrix_json" | jq .
+
+  build:
+    name: Build ${{ matrix.target }} on ${{ matrix.container.label }}
+    runs-on: ubuntu-22.04
+    needs: prepare-matrix
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+    timeout-minutes: 1440
+    steps:
+      - name: Free up disk space
+        run: |
+          echo "=== Disk space before cleanup ==="
+          df -h
+
+          # Remove unnecessary software (only for GitHub-hosted runners)
+          if [ -d "/usr/share/dotnet" ]; then
+            echo "Removing .NET..."
+            sudo rm -rf /usr/share/dotnet
+          fi
+
+          if [ -d "/usr/local/lib/android" ]; then
+            echo "Removing Android SDK..."
+            sudo rm -rf /usr/local/lib/android
+          fi
+
+          if [ -d "/opt/ghc" ]; then
+            echo "Removing GHC..."
+            sudo rm -rf /opt/ghc
+          fi
+
+          if [ -d "/usr/local/share/boost" ]; then
+            echo "Removing Boost..."
+            sudo rm -rf /usr/local/share/boost
+          fi
+
+          echo "=== Disk space after cleanup ==="
+          df -h
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: true
+
+      - name: Check disk space
+        run: |
+          echo "Disk space:"
+          df -h
+          echo ""
+          echo "Docker info:"
+          docker info | grep -E "Docker Root Dir|Storage Driver" || true
+
+      - name: Check Docker
+        run: |
+          # Check if Docker is running
+          docker info || echo "Docker may not be running, but will try to continue"
+          docker --version
+
+      - name: Build with Docker
+        run: |
+          chmod +x scripts/build-with-docker.sh
+          ./scripts/build-with-docker.sh \
+            "${{ matrix.target }}" \
+            "${{ matrix.container.image }}" \
+            "${{ matrix.container.label }}"
+
+      - name: Collect build artifacts
+        run: |
+          # Copy build artifacts from container
+          docker cp gnu-cross-build-${{ matrix.container.label }}:/workspace/gnu-cross/${{ matrix.target }}-${{ matrix.container.label }}.tar.xz .
+          docker cp gnu-cross-build-${{ matrix.container.label }}:/workspace/gnu-cross/${{ matrix.target }}-${{ matrix.container.label }}.tar.xz.sha256 .
+
+          echo "Build artifacts:"
+          ls -lh ${{ matrix.target }}-${{ matrix.container.label }}.tar.xz*
+
+          echo "SHA256:"
+          cat ${{ matrix.target }}-${{ matrix.container.label }}.tar.xz.sha256
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}-${{ matrix.container.label }}.tar.xz
+          path: ${{ matrix.target }}-${{ matrix.container.label }}.tar.xz
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}-${{ matrix.container.label }}.tar.xz.sha256
+          path: ${{ matrix.target }}-${{ matrix.container.label }}.tar.xz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # Stop and remove container
+          docker stop gnu-cross-build-${{ matrix.container.label }} || true
+          docker rm -f gnu-cross-build-${{ matrix.container.label }} || true
+
+          # Clean up Docker system
+          docker system prune -f || true
+
+          echo "Disk space after cleanup:"
+          df -h
+
+  release:
+    name: Release
+    runs-on: ubuntu-22.04
+    needs:
+      - build
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.create_release == true)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          pattern: "*.tar.*"
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          echo "| Filename | Sha256sum |" > RELEASE.md
+          echo "| -------- | --------- |" >> RELEASE.md
+          for i in release/*.sha256; do
+            echo "| $(basename $i .sha256) | $(cat $i) |" >> RELEASE.md
+          done
+
+          echo "Release content:"
+          cat RELEASE.md
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Determine release tag
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          else
+            TAG="${{ inputs.release_tag }}"
+          fi
+
+          echo "Release tag: $TAG"
+
+          # Check if release exists
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, uploading artifacts..."
+            for i in release/*.tar.xz; do
+              gh release upload "$TAG" "$i" "$i.sha256" --clobber
+            done
+            gh release edit "$TAG" -F RELEASE.md
+          else
+            echo "Creating new release $TAG..."
+            gh release create "$TAG" \
+              --title "Release $TAG" \
+              --notes-file RELEASE.md \
+              release/*.tar.xz release/*.sha256
+          fi

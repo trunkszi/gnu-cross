@@ -1,0 +1,14 @@
+diff --git a/scripts/functions b/scripts/functions
+index 3fe71e8..a2522fa 100644
+--- a/scripts/functions
++++ b/scripts/functions
+@@ -1842,6 +1842,9 @@ CT_Mirrors()
+                 ;;
+             [3456].*)
+                 echo "https://cdn.kernel.org/pub/linux/kernel/v${version%%.*}.x"
++                echo "https://mirrors.edge.kernel.org/pub/linux/kernel/v${version%%.*}.x"
++                echo "https://mirrors.aliyun.com/linux-kernel/v${version%%.*}.x"
++                echo "https://mirrors.tuna.tsinghua.edu.cn/kernel/v${version%%.*}.x"
+                 ;;
+             2.6.*)
+                 echo "https://cdn.kernel.org/pub/linux/kernel/v2.6"
