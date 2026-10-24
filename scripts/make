@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PROJECT_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
+SUPPORTED_TARGET="x86_64-unknown-linux-gnu"
+
+usage() {
+    echo "Usage: $0 <target> [--skip-deps]" >&2
+    echo "Example: $0 ${SUPPORTED_TARGET}" >&2
+}
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+    usage
+    exit 64
+fi
+
+TARGET=$1
+SKIP_DEPS=false
+if [[ $# -eq 2 ]]; then
+    if [[ "$2" != "--skip-deps" ]]; then
+        echo "Error: unknown option: $2" >&2
+        usage
+        exit 64
+    fi
+    SKIP_DEPS=true
+fi
+
+if [[ "${TARGET}" != "${SUPPORTED_TARGET}" || ! -f "${PROJECT_ROOT}/targets/${TARGET}/config" ]]; then
+    echo "Error: unsupported target: ${TARGET}" >&2
+    exit 1
+fi
+
+VERSIONS_FILE="${PROJECT_ROOT}/targets/${TARGET}/versions"
+if [[ ! -f "${VERSIONS_FILE}" ]]; then
+    echo "Error: missing versions file: ${VERSIONS_FILE}" >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+source "${VERSIONS_FILE}"
+: "${EXPECTED_GCC_VERSION:?}"
+: "${EXPECTED_MOLD_VERSION:?}"
+: "${EXPECTED_BINUTILS_VERSION:?}"
+: "${EXPECTED_LINUX_VERSION:?}"
+
+SUDO_CMD=""
+if [[ "$(id -u)" -ne 0 ]]; then
+    SUDO_CMD="sudo"
+fi
+export SUDO_CMD
+
+detect_system() {
+    local system="unknown"
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        source /etc/os-release
+        case "${ID}" in
+            ubuntu)
+                if [[ "${VERSION_ID}" == "22.04" ]]; then
+                    system="ubuntu22"
+                else
+                    system="debian"
+                fi
+                ;;
+            debian|linuxmint)
+                system="debian"
+                ;;
+            alinux)
+                if [[ "${VERSION_ID}" == "3" ]]; then
+                    system="alinux3"
+                else
+                    system="rhel"
+                fi
+                ;;
+            amzn)
+                if [[ "${VERSION_ID}" == "2" ]]; then
+                    system="amazonlinux2"
+                elif [[ "${VERSION_ID}" == "2023" ]]; then
+                    system="amazonlinux2023"
+                else
+                    system="rhel"
+                fi
+                ;;
+            centos)
+                if [[ "${VERSION_ID}" == "7" ]]; then
+                    system="centos7"
+                else
+                    system="rhel"
+                fi
+                ;;
+            rhel|fedora|rocky|almalinux)
+                system="rhel"
+                ;;
+            arch|manjaro)
+                system="arch"
+                ;;
+            alpine)
+                system="alpine"
+                ;;
+            *)
+                if [[ -n "${ID_LIKE:-}" ]]; then
+                    case "${ID_LIKE}" in
+                        *rhel*|*fedora*|*centos*) system="rhel" ;;
+                        *debian*|*ubuntu*) system="debian" ;;
+                        *arch*) system="arch" ;;
+                    esac
+                fi
+                ;;
+        esac
+    elif command -v apt-get >/dev/null 2>&1; then
+        system="debian"
+    elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+        system="rhel"
+    elif command -v pacman >/dev/null 2>&1; then
+        system="arch"
+    elif command -v apk >/dev/null 2>&1; then
+        system="alpine"
+    fi
+    printf '%s\n' "${system}"
+}
+
+run_package_update() {
+    local status=0
+    case "${PKG_MANAGER}" in
+        dnf)
+            set +e
+            timeout 120 ${SUDO_CMD} dnf check-update
+            status=$?
+            set -e
+            ;;
+        yum)
+            set +e
+            timeout 120 ${SUDO_CMD} yum check-update
+            status=$?
+            set -e
+            ;;
+        apt-get)
+            ${SUDO_CMD} apt-get update || return $?
+            return 0
+            ;;
+        pacman)
+            ${SUDO_CMD} pacman -Sy || return $?
+            return 0
+            ;;
+        apk)
+            ${SUDO_CMD} apk update || return $?
+            return 0
+            ;;
+        *)
+            echo "Error: unsupported package manager: ${PKG_MANAGER}" >&2
+            return 1
+            ;;
+    esac
+    if [[ "${PKG_MANAGER}" == "dnf" || "${PKG_MANAGER}" == "yum" ]]; then
+        if [[ ${status} -ne 0 && ${status} -ne 100 ]]; then
+            echo "Error: ${PKG_MANAGER} check-update exited ${status}" >&2
+            return "${status}"
+        fi
+    fi
+}
+
+run_package_install() {
+    case "${PKG_MANAGER}" in
+        dnf)
+            ${SUDO_CMD} dnf install -y "${PACKAGES[@]}"
+            ;;
+        yum)
+            ${SUDO_CMD} yum install -y "${PACKAGES[@]}"
+            ;;
+        apt-get)
+            ${SUDO_CMD} apt-get install -y --no-install-recommends "${PACKAGES[@]}"
+            ;;
+        pacman)
+            ${SUDO_CMD} pacman -S --noconfirm --needed "${PACKAGES[@]}"
+            ;;
+        apk)
+            ${SUDO_CMD} apk add "${PACKAGES[@]}"
+            ;;
+        *)
+            echo "Error: unsupported package manager: ${PKG_MANAGER}" >&2
+            return 1
+            ;;
+    esac
+}
+
+install_dependencies_once() {
+    local state status=0 name
+    state=$(mktemp)
+    {
+        printf 'set -euo pipefail\n'
+        declare -f
+        for name in SUDO_CMD PKG_MANAGER PACKAGES MIRROR_SETUP_COMMANDS EXTRA_SETUP_COMMANDS USE_PIP_CMAKE USE_GCC10 USE_DEVTOOLSET PATH; do
+            if declare -p "${name}" >/dev/null 2>&1; then declare -p "${name}"; fi
+        done
+        cat "${SCRIPT_DIR:-${root}/scripts}/package-attempt.sh"
+    } | bash -e -s -- "${state}" || status=$?
+    if [[ ${status} -eq 0 ]]; then source "${state}"; fi
+    rm -f -- "${state}"; return "${status}"
+}
+
+install_dependencies() {
+    local system config_file attempt
+    system=$(detect_system)
+    if [[ "${system}" == "unknown" ]]; then
+        echo "Error: unable to detect operating system" >&2
+        exit 1
+    fi
+    config_file="${SCRIPT_DIR}/packages/${system}.conf"
+    if [[ ! -f "${config_file}" ]]; then
+        echo "Error: unsupported system '${system}'" >&2
+        exit 1
+    fi
+    echo "Detected operating system: ${system}"
+    # shellcheck disable=SC1090
+    source "${config_file}"
+    [[ -v MIRROR_SETUP_COMMANDS ]] || MIRROR_SETUP_COMMANDS=()
+    [[ -v EXTRA_SETUP_COMMANDS ]] || EXTRA_SETUP_COMMANDS=()
+    for attempt in 1 2 3; do
+        echo "Dependency installation attempt ${attempt}/3"
+        if install_dependencies_once; then
+            echo "Dependency installation completed"
+            return 0
+        fi
+        echo "Dependency installation attempt ${attempt} failed" >&2
+        if [[ ${attempt} -lt 3 ]]; then
+            sleep 2
+        fi
+    done
+    echo "Error: dependency installation failed after 3 attempts" >&2
+    exit 1
+}
+
+if [[ "${SKIP_DEPS}" == false ]]; then
+    install_dependencies
+else
+    echo "Skipping dependency installation (--skip-deps)"
+fi
+
+echo "Applying patches..."
+pushd "${PROJECT_ROOT}/builder" >/dev/null
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    repo_top=$(git rev-parse --show-toplevel)
+    if [[ "${repo_top}" == "$(pwd)" ]]; then
+        git reset --hard HEAD
+        git clean -fd
+    fi
+fi
+shopt -s nullglob
+for i in "${PROJECT_ROOT}/targets/${TARGET}/"*.patch; do
+    echo "Applying patch: ${i}"
+    patch --fuzz=0 --batch -Np1 -i "${i}"
+done
+shopt -u nullglob
+popd >/dev/null
+
+echo "Building crosstool-ng..."
+${SUDO_CMD} mkdir -p /opt/ct-ng /opt/x-tools
+pushd "${PROJECT_ROOT}/builder" >/dev/null
+./bootstrap
+./configure --prefix=/opt/ct-ng
+make -j"$(nproc)"
+${SUDO_CMD} make install
+popd >/dev/null
+
+echo "Building toolchain: ${TARGET}"
+rm -rf "${PROJECT_ROOT}/build"
+mkdir -p "${PROJECT_ROOT}/build"
+cp "${PROJECT_ROOT}/targets/${TARGET}/config" "${PROJECT_ROOT}/build/.config"
+
+system=$(detect_system)
+case "${system}" in
+    alinux3) EXPECTED_GLIBC_VERSION=2.32 ;;
+    amazonlinux2) EXPECTED_GLIBC_VERSION=2.26 ;;
+    centos7) EXPECTED_GLIBC_VERSION=2.17 ;;
+    ubuntu22) EXPECTED_GLIBC_VERSION=2.34 ;;
+    *)
+        echo "Error: host profile '${system}' has no glibc ABI policy" >&2
+        exit 1
+        ;;
+esac
+glibc_symbol=${EXPECTED_GLIBC_VERSION//./_}
+tmp_config=$(mktemp)
+grep -Ev '^(# )?CT_GLIBC_V_' "${PROJECT_ROOT}/build/.config" > "${tmp_config}" || true
+printf 'CT_GLIBC_V_%s=y\n' "${glibc_symbol}" >> "${tmp_config}"
+sed -i '/^CT_GLIBC_MIN_KERNEL=/d' "${tmp_config}"
+printf 'CT_GLIBC_MIN_KERNEL="%s"\n' "${EXPECTED_LINUX_VERSION}" >> "${tmp_config}"
+mv "${tmp_config}" "${PROJECT_ROOT}/build/.config"
+
+assert_config_value() {
+    local key=$1 expected=$2 line
+    line=$(grep -E "^${key}=" "${PROJECT_ROOT}/build/.config" | tail -n 1 || true)
+    if [[ "${line}" != "${key}=\"${expected}\"" && "${line}" != "${key}=${expected}" ]]; then
+        echo "Error: ${key} expected ${expected}, found '${line}'" >&2
+        exit 1
+    fi
+}
+
+pushd "${PROJECT_ROOT}/build" >/dev/null
+/opt/ct-ng/bin/ct-ng olddefconfig
+assert_config_value CT_GCC_VERSION "${EXPECTED_GCC_VERSION}"
+assert_config_value CT_MOLD_VERSION "${EXPECTED_MOLD_VERSION}"
+assert_config_value CT_GLIBC_VERSION "${EXPECTED_GLIBC_VERSION}"
+assert_config_value CT_BINUTILS_VERSION "${EXPECTED_BINUTILS_VERSION}"
+assert_config_value CT_LINUX_VERSION "${EXPECTED_LINUX_VERSION}"
+assert_config_value CT_GLIBC_MIN_KERNEL "${EXPECTED_LINUX_VERSION}"
+/opt/ct-ng/bin/ct-ng build
+popd >/dev/null
+
+"${PROJECT_ROOT}/scripts/verify-toolchain.sh" \
+    "${TARGET}" "/opt/x-tools/${TARGET}" \
+    "${EXPECTED_GCC_VERSION}" "${EXPECTED_GLIBC_VERSION}"
+
+echo "Packaging toolchain..."
+archive="${PROJECT_ROOT}/${TARGET}.tar.xz"
+digest="${archive}.sha256"
+${SUDO_CMD} tar -C /opt/x-tools --owner=0 --group=0 -cJvf "${archive}" "${TARGET}"
+hash=$(sha256sum "${archive}" | awk '{ print $1 }')
+[[ "${hash}" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "Error: checksum is not 64 hexadecimal characters" >&2
+    exit 1
+}
+printf '%s\n' "${hash}" > "${digest}"
+actual=$(sha256sum "${archive}" | awk '{ print $1 }')
+[[ "${actual}" == "${hash}" ]] || {
+    echo "Error: packaged checksum does not match the archive" >&2
+    exit 1
+}
+
+echo "Build completed"
+echo "SHA256: ${hash}"

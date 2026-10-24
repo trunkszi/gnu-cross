@@ -1,0 +1,411 @@
+name: Release
+
+on:
+  schedule:
+    - cron: '20 2 * * *'
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: 'Target architecture list (comma-separated)'
+        required: false
+        default: 'x86_64-unknown-linux-gnu'
+        type: string
+      containers:
+        description: 'Container selection (comma-separated: amazonlinux2,alinux3,centos7,ubuntu22,all)'
+        required: false
+        default: 'all'
+        type: string
+      create_release:
+        description: 'Create GitHub Release'
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        description: 'Release tag replaced after a verified upload'
+        required: false
+        default: 'v0.0.1'
+        type: string
+      source_run_id:
+        description: 'Reuse artifacts from this run without compiling (empty builds new artifacts)'
+        required: false
+        default: ''
+        type: string
+      check_upstream:
+        description: 'Resolve the latest stable crosstool-NG release before building'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: gnu-cross-release-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  prepare-matrix:
+    name: Prepare Build Matrix
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      should_build: ${{ steps.decide.outputs.should_build }}
+      upstream_updated: ${{ steps.decide.outputs.upstream_updated }}
+      status: ${{ steps.decide.outputs.status }}
+      artifact_sha: ${{ steps.source-run.outputs.artifact_sha }}
+      upstream_versions: ${{ steps.decide.outputs.upstream_versions }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Validate source run
+        id: source-run
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/source-snapshot.py run
+
+      - name: Resolve upstream
+        id: decide
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CHECK_UPSTREAM: ${{ inputs.check_upstream }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          status="locked"
+          updated=false
+          build=true
+          source targets/x86_64-unknown-linux-gnu/versions
+          accepted_versions="ct-ng ${CTNG_RELEASE_TAG}@${CTNG_COMMIT}; GCC ${EXPECTED_GCC_VERSION}; mold ${EXPECTED_MOLD_VERSION}; binutils ${EXPECTED_BINUTILS_VERSION}; Linux ${EXPECTED_LINUX_VERSION}"
+          echo "upstream_versions=Accepted: ${accepted_versions}" >> "${GITHUB_OUTPUT}"
+          if [[ -z "${SOURCE_RUN_ID}" && ( "${EVENT_NAME}" == "schedule" || "${CHECK_UPSTREAM}" == "true" ) ]]; then
+            if ! sync_output=$(./scripts/sync-upstream.sh --apply --summary-file "${GITHUB_STEP_SUMMARY}"); then
+              printf '%s\n' "${sync_output}"
+              exit 1
+            fi
+            printf '%s\n' "${sync_output}"
+            status=$(printf '%s\n' "${sync_output}" | sed -n 's/^status=//p' | tail -n 1)
+            if [[ "${status}" == "updated" ]]; then
+              updated=true
+              build=true
+            elif [[ "${status}" == "no_update" && "${EVENT_NAME}" == "schedule" ]]; then
+              updated=false
+              build=false
+            elif [[ "${status}" == "no_update" || "${status}" == "update_available" ]]; then
+              updated=false
+              build=true
+            else
+              echo "unexpected sync status: ${status}" >&2
+              exit 1
+            fi
+          fi
+          if [[ -n "${SOURCE_RUN_ID}" ]]; then
+            build=false
+          fi
+          echo "should_build=${build}" >> "${GITHUB_OUTPUT}"
+          echo "upstream_updated=${updated}" >> "${GITHUB_OUTPUT}"
+          echo "status=${status}" >> "${GITHUB_OUTPUT}"
+          source targets/x86_64-unknown-linux-gnu/versions
+          echo "upstream_versions=Accepted: ${accepted_versions}; Selected: ct-ng ${CTNG_RELEASE_TAG}@${CTNG_COMMIT}; GCC ${EXPECTED_GCC_VERSION}; mold ${EXPECTED_MOLD_VERSION}; binutils ${EXPECTED_BINUTILS_VERSION}; Linux ${EXPECTED_LINUX_VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Prepare candidate source
+        if: steps.decide.outputs.should_build == 'true'
+        env:
+          UPDATED: ${{ steps.decide.outputs.upstream_updated }}
+        run: python3 scripts/source-snapshot.py prepare "${RUNNER_TEMP}/candidate-source" "${UPDATED}"
+
+      - name: Upload candidate source
+        if: steps.decide.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: candidate-source
+          path: ${{ runner.temp }}/candidate-source/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Set up matrix
+        id: set-matrix
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TARGETS: ${{ inputs.targets }}
+          INPUT_CONTAINERS: ${{ inputs.containers }}
+          SHOULD_BUILD: ${{ steps.decide.outputs.should_build }}
+        run: |
+          set -euo pipefail
+          declare -A containers
+          containers[amazonlinux2]='{"image":"public.ecr.aws/amazonlinux/amazonlinux:2","label":"amazonlinux2"}'
+          containers[alinux3]='{"image":"alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest","label":"alinux3"}'
+          containers[centos7]='{"image":"centos:7.9.2009","label":"centos7"}'
+          containers[ubuntu22]='{"image":"ubuntu:22.04","label":"ubuntu22"}'
+
+          targets_input=${INPUT_TARGETS:-x86_64-unknown-linux-gnu}
+          containers_input=${INPUT_CONTAINERS:-all}
+          if [[ "${EVENT_NAME}" == "schedule" || -z "${targets_input}" ]]; then
+            targets_input="x86_64-unknown-linux-gnu"
+          fi
+          if [[ "${EVENT_NAME}" == "schedule" || -z "${containers_input}" ]]; then
+            containers_input="all"
+          fi
+          if [[ "${SHOULD_BUILD}" != "true" ]]; then
+            echo 'matrix={"include":[]}' >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          IFS=',' read -ra targets <<< "${targets_input}"
+          if [[ "${containers_input}" == "all" ]]; then
+            selected=(amazonlinux2 alinux3 centos7 ubuntu22)
+          else
+            IFS=',' read -ra selected <<< "${containers_input}"
+          fi
+
+          matrix_json='{"include":['
+          first=true
+          for target in "${targets[@]}"; do
+            [[ "${target}" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "unsupported target: ${target}" >&2; exit 1; }
+            [[ "${target}" == "x86_64-unknown-linux-gnu" ]] || { echo "unsupported target: ${target}" >&2; exit 1; }
+            for container in "${selected[@]}"; do
+              [[ "${container}" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "unsupported container: ${container}" >&2; exit 1; }
+              [[ -n "${containers[${container}]:-}" ]] || { echo "unsupported container: ${container}" >&2; exit 1; }
+              if [[ "${first}" == true ]]; then
+                first=false
+              else
+                matrix_json+=','
+              fi
+              matrix_json+="{\"target\":\"${target}\",\"container\":${containers[${container}]}}"
+            done
+          done
+          matrix_json+=']}'
+          echo "matrix=${matrix_json}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: Build ${{ matrix.target }} on ${{ matrix.container.label }}
+    needs: prepare-matrix
+    if: needs.prepare-matrix.outputs.should_build == 'true'
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          submodules: false
+
+      - name: Download candidate source
+        uses: actions/download-artifact@v8
+        with:
+          name: candidate-source
+          path: .candidate-source
+          run-id: ${{ inputs.source_run_id || github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Restore candidate source
+        id: restore
+        env:
+          ARTIFACT_SHA: ${{ needs.prepare-matrix.outputs.artifact_sha }}
+        run: python3 scripts/source-snapshot.py restore .candidate-source "${ARTIFACT_SHA}"
+
+      - name: Checkout selected crosstool-NG commit
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source targets/x86_64-unknown-linux-gnu/versions
+          git submodule update --init --depth 1 builder
+          git -C builder fetch --depth 1 origin "${CTNG_COMMIT}"
+          git -C builder checkout --detach "${CTNG_COMMIT}"
+
+      - name: Build with Docker
+        env:
+          TARGET: ${{ matrix.target }}
+          IMAGE: ${{ matrix.container.image }}
+          LABEL: ${{ matrix.container.label }}
+        run: |
+          set -euo pipefail
+          chmod +x scripts/build-with-docker.sh scripts/make scripts/verify-toolchain.sh
+          ./scripts/build-with-docker.sh "${TARGET}" "${IMAGE}" "${LABEL}"
+
+      - name: Verify packaged artifacts
+        env:
+          TARGET: ${{ matrix.target }}
+          LABEL: ${{ matrix.container.label }}
+        run: |
+          set -euo pipefail
+          archive="${TARGET}-${LABEL}.tar.xz"
+          checksum="${archive}.sha256"
+          test -f "${archive}"
+          test -f "${checksum}"
+          expected=$(awk 'NR == 1 { print $1 }' "${checksum}")
+          [[ "${expected}" =~ ^[0-9a-f]{64}$ ]]
+          printf '%s  %s\n' "${expected}" "${archive}" | sha256sum --check -
+          ARTIFACT_SHA="${{ needs.prepare-matrix.outputs.artifact_sha }}" python3 scripts/release-artifacts.py record . "${LABEL}"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}-${{ matrix.container.label }}.tar.xz
+          path: ${{ matrix.target }}-${{ matrix.container.label }}.tar.xz
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload checksum
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}-${{ matrix.container.label }}.tar.xz.sha256
+          path: ${{ matrix.target }}-${{ matrix.container.label }}.tar.xz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload provenance
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}-${{ matrix.container.label }}.tar.xz.manifest
+          path: ${{ matrix.target }}-${{ matrix.container.label }}.tar.xz.manifest.json
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Release
+    outputs:
+      assets_touched: ${{ steps.publish.outputs.assets_touched || 'false' }}
+      upstream_versions: ${{ steps.restore.outputs.upstream_versions }}
+    runs-on: ubuntu-22.04
+    needs:
+      - prepare-matrix
+      - build
+    if: |
+      always() &&
+      needs.prepare-matrix.result == 'success' &&
+      (
+        needs.build.result == 'success' ||
+        (needs.build.result == 'skipped' && github.event_name == 'workflow_dispatch' && inputs.source_run_id != '')
+      ) &&
+      (
+        (github.event_name == 'schedule' && needs.prepare-matrix.outputs.upstream_updated == 'true') ||
+        (github.event_name == 'workflow_dispatch' && inputs.create_release == true &&
+         inputs.containers == 'all' && inputs.targets == 'x86_64-unknown-linux-gnu')
+      )
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Download candidate source
+        uses: actions/download-artifact@v8
+        with:
+          name: candidate-source
+          path: .candidate-source
+          run-id: ${{ inputs.source_run_id || github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Restore candidate source
+        id: restore
+        env:
+          ARTIFACT_SHA: ${{ needs.prepare-matrix.outputs.artifact_sha }}
+        run: python3 scripts/source-snapshot.py restore .candidate-source "${ARTIFACT_SHA}"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release
+          pattern: "*.tar.*"
+          merge-multiple: true
+          run-id: ${{ inputs.source_run_id || github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify artifacts and generate release notes
+        env:
+          ARTIFACT_SHA: ${{ needs.prepare-matrix.outputs.artifact_sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release-artifacts.py verify release
+          echo "| Filename | Sha256sum |" > RELEASE.md
+          echo "| -------- | --------- |" >> RELEASE.md
+          for container in amazonlinux2 alinux3 centos7 ubuntu22; do
+            artifact="x86_64-unknown-linux-gnu-${container}.tar.xz"
+            checksum="release/${artifact}.sha256"
+            test -f "release/${artifact}"
+            test -f "${checksum}"
+            expected_hash=$(head -n 1 "${checksum}")
+            expected_hash=${expected_hash%% *}
+            [[ "${expected_hash}" =~ ^[0-9a-f]{64}$ ]]
+            printf '%s  %s\n' "${expected_hash}" "release/${artifact}" | sha256sum --check -
+            echo "| ${artifact} | ${expected_hash} |" >> RELEASE.md
+          done
+
+      - name: Create or update release
+        id: publish
+        env:
+          TAG: ${{ github.event_name == 'schedule' && 'v0.0.1' || inputs.release_tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_SHA: ${{ needs.prepare-matrix.outputs.artifact_sha }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          bash scripts/publish-release.sh
+
+  notify-failure:
+    name: Notify failure
+    runs-on: ubuntu-22.04
+    needs:
+      - prepare-matrix
+      - build
+      - release
+    if: always() && (needs.prepare-matrix.result == 'failure' || needs.build.result == 'failure' || needs.release.result == 'failure')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Write failure diagnostic
+        env:
+          PREPARE_RESULT: ${{ needs.prepare-matrix.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+          RELEASE_ASSETS_TOUCHED: ${{ needs.release.outputs.assets_touched }}
+          UPSTREAM_VERSIONS: ${{ needs.release.outputs.upstream_versions || needs.prepare-matrix.outputs.upstream_versions }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+          NOTIFY_EMAIL_TO: ${{ secrets.NOTIFY_EMAIL_TO }}
+        run: |
+          set -euo pipefail
+          if [[ "${PREPARE_RESULT}" == failure ]]; then
+            FAILURE_STAGE=UPSTREAM_PREFLIGHT_FAILED
+          elif [[ "${BUILD_RESULT}" == failure ]]; then
+            FAILURE_STAGE=TOOLCHAIN_BUILD_FAILED
+          else
+            FAILURE_STAGE=PUBLICATION_FAILED
+          fi
+          PUBLISHED_STATE=UNTOUCHED
+          if [[ "${RELEASE_ASSETS_TOUCHED:-}" == true || ( "${RELEASE_RESULT}" == failure && "${RELEASE_ASSETS_TOUCHED:-}" != false ) ]]; then
+            PUBLISHED_STATE='PARTIAL_UPDATE_POSSIBLE (Manual check required)'
+          fi
+          if [[ -z "${UPSTREAM_VERSIONS:-}" && -f targets/x86_64-unknown-linux-gnu/versions ]]; then
+            source targets/x86_64-unknown-linux-gnu/versions
+            UPSTREAM_VERSIONS="Accepted ct-ng ${CTNG_RELEASE_TAG}@${CTNG_COMMIT}; GCC ${EXPECTED_GCC_VERSION}; mold ${EXPECTED_MOLD_VERSION}"
+          fi
+          UPSTREAM_VERSIONS=${UPSTREAM_VERSIONS:-unknown}
+          RUN_URL="https://github.com/${GITHUB_REPOSITORY:-unknown}/actions/runs/${GITHUB_RUN_ID:-unknown}"
+          export FAILURE_STAGE PUBLISHED_STATE UPSTREAM_VERSIONS RUN_URL
+          {
+            echo "## ${FAILURE_STAGE}"
+            echo "Published v0.0.1 Release: ${PUBLISHED_STATE}"
+            echo "prepare-matrix: ${PREPARE_RESULT}; build: ${BUILD_RESULT}; release: ${RELEASE_RESULT}"
+            echo "Upstream: ${UPSTREAM_VERSIONS}"
+            echo "Run: ${RUN_URL}"
+            echo "Native GitHub notifications depend on subscription settings; SMTP uses the configured recipient."
+          } >> "${GITHUB_STEP_SUMMARY}"
+          echo "::error title=${FAILURE_STAGE}::${FAILURE_STAGE}; Published v0.0.1 Release: ${PUBLISHED_STATE}"
+          if [[ -n "${SMTP_HOST:-}" && -n "${SMTP_USERNAME:-}" && -n "${SMTP_PASSWORD:-}" && -n "${NOTIFY_EMAIL_TO:-}" ]]; then
+            python3 scripts/notify-failure.py
+          fi
